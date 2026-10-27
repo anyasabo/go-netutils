@@ -102,6 +102,29 @@ func TestIpDefrag_IPv6Fragment(t *testing.T) {
 	}
 }
 
+// checkDefragmenter fails the test if the memory accounting or the lru list
+// no longer match the tracked flows.
+func checkDefragmenter(t *testing.T, d *IPDefragmenter) {
+	t.Helper()
+	if d.lru.Len() != len(d.ipFlows) {
+		t.Fatalf("lru holds %d flows, map holds %d", d.lru.Len(), len(d.ipFlows))
+	}
+	var size int
+	for e := d.lru.Front(); e != nil; e = e.Next() {
+		fl := e.Value.(*fragments)
+		if d.ipFlows[fl.key] != fl {
+			t.Fatalf("lru flow %v is not in the map", fl.key)
+		}
+		size += fl.size
+	}
+	if size != d.size {
+		t.Fatalf("flows hold %d bytes, defragmenter counts %d", size, d.size)
+	}
+	if d.size > d.memoryLimit {
+		t.Fatalf("defragmenter holds %d bytes, limit is %d", d.size, d.memoryLimit)
+	}
+}
+
 // trackedBytes returns the captured bytes that the defragmenter holds for incomplete flows.
 func trackedBytes(d *IPDefragmenter) int {
 	var n int
@@ -154,6 +177,7 @@ func TestIpDefrag_IPv4IncompleteFlowsAreBounded(t *testing.T) {
 		}
 	}
 
+	checkDefragmenter(t, defragger)
 	const limit = 8 << 20
 	if n := trackedBytes(defragger); n > limit {
 		t.Errorf("defragmenter holds %d bytes of incomplete flows, want at most %d", n, limit)
@@ -194,7 +218,8 @@ func TestIpDefrag_IPv4FutureTimestampDoesNotStopExpiry(t *testing.T) {
 		}
 	}
 
-	if n := len(defragger.ipFlows); n > 32 {
-		t.Errorf("%d flows tracked, want at most the last 30s of flows", n)
+	checkDefragmenter(t, defragger)
+	if n := len(defragger.ipFlows); n > int(IPFragmentTimeout/time.Second)+2 {
+		t.Errorf("%d flows tracked, want at most the last %v of flows", n, IPFragmentTimeout)
 	}
 }
