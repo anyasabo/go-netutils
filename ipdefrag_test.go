@@ -1,7 +1,9 @@
 package netutils
 
 import (
+	"net"
 	"testing"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -97,5 +99,102 @@ func TestIpDefrag_IPv6Fragment(t *testing.T) {
 
 	if pkt.Metadata().Length != 137 {
 		t.Errorf("Invalid reassembled packet size: %v", err)
+	}
+}
+
+// trackedBytes returns the captured bytes that the defragmenter holds for incomplete flows.
+func trackedBytes(d *IPDefragmenter) int {
+	var n int
+	for _, fl := range d.ipFlows {
+		for e := fl.List.Front(); e != nil; e = e.Next() {
+			n += len(e.Value.(gopacket.Packet).Data())
+		}
+	}
+	return n
+}
+
+// A fragment whose flow never completes must not stay in memory forever. The
+// sniffer BPF filter accepts every non-first fragment but drops the first
+// fragment of a non-DNS datagram, so these flows are common in live capture.
+func TestIpDefrag_IPv4IncompleteFlowsExpire(t *testing.T) {
+	defragger := NewIPDefragmenter()
+	start := time.Unix(1700000000, 0)
+	src := net.IP{10, 0, 0, 1}
+
+	for id := 0; id < 1000; id++ {
+		frag := newIPv4Fragment(t, src, uint16(id), 185, false, make([]byte, 100), start)
+		if _, err := defragger.DefragIP(frag); err != nil {
+			t.Fatalf("unexpected error for fragment %d: %v", id, err)
+		}
+	}
+
+	later := newIPv4Fragment(t, src, 5000, 185, false, make([]byte, 100), start.Add(10*time.Minute))
+	if _, err := defragger.DefragIP(later); err != nil {
+		t.Fatalf("unexpected error for the later fragment: %v", err)
+	}
+
+	if n := len(defragger.ipFlows); n > 1 {
+		t.Errorf("%d incomplete flows still tracked 10 minutes later, want at most 1", n)
+	}
+}
+
+// A burst of incomplete flows inside the timeout must not grow memory without
+// limit, and the burst must not block the reassembly of new DNS flows.
+func TestIpDefrag_IPv4IncompleteFlowsAreBounded(t *testing.T) {
+	defragger := NewIPDefragmenter()
+	ts := time.Unix(1700000000, 0)
+	payload := make([]byte, 1400)
+
+	// 20000 flows of about 1.4 KB each is about 28 MB of captured data.
+	for i := 0; i < 20000; i++ {
+		src := net.IP{10, 1, byte(i >> 8), byte(i)}
+		frag := newIPv4Fragment(t, src, uint16(i), 185, true, payload, ts)
+		if _, err := defragger.DefragIP(frag); err != nil {
+			t.Fatalf("unexpected error for fragment %d: %v", i, err)
+		}
+	}
+
+	const limit = 8 << 20
+	if n := trackedBytes(defragger); n > limit {
+		t.Errorf("defragmenter holds %d bytes of incomplete flows, want at most %d", n, limit)
+	}
+
+	frag1, frag2 := dnsQueryIPv4Fragments()
+	frag1.Metadata().Timestamp = ts
+	frag2.Metadata().Timestamp = ts
+	if _, err := defragger.DefragIP(frag1); err != nil {
+		t.Fatalf("unexpected error on the 1st DNS fragment: %v", err)
+	}
+	pkt, err := defragger.DefragIP(frag2)
+	if err != nil {
+		t.Fatalf("unexpected error on the 2nd DNS fragment: %v", err)
+	}
+	if pkt == nil {
+		t.Fatal("DNS query not reassembled after a burst of incomplete flows")
+	}
+}
+
+// One fragment with a far-future capture time must not stop the expiry of the
+// flows that come after it.
+func TestIpDefrag_IPv4FutureTimestampDoesNotStopExpiry(t *testing.T) {
+	defragger := NewIPDefragmenter()
+	start := time.Unix(1700000000, 0)
+	src := net.IP{10, 0, 0, 1}
+
+	future := newIPv4Fragment(t, src, 1, 185, true, make([]byte, 100), start.Add(100*365*24*time.Hour))
+	if _, err := defragger.DefragIP(future); err != nil {
+		t.Fatalf("unexpected error for the future fragment: %v", err)
+	}
+
+	// One fragment per second for 1000 seconds, each in its own flow.
+	for i := 0; i < 1000; i++ {
+		frag := newIPv4Fragment(t, src, uint16(i+2), 185, true, make([]byte, 100), start.Add(time.Duration(i)*time.Second))
+		if _, err := defragger.DefragIP(frag); err != nil {
+			t.Fatalf("unexpected error for fragment %d: %v", i, err)
+		}
+	}
+
+	if n := len(defragger.ipFlows); n > 32 {
+		t.Errorf("%d flows tracked, want at most the last 30s of flows", n)
 	}
 }
